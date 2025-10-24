@@ -1,0 +1,27 @@
+name: Auto-assign Agency team to new repositories
+
+on:
+  repository:
+    types: [created]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  add-agency-team:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add Agency team to new repository
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+          ORG: digismoothie-agency
+          TEAM_SLUG: agency
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          echo "Assigning team '$TEAM_SLUG' to repo '$REPO'"
+          curl -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/orgs/$ORG/teams/$TEAM_SLUG/repos/$ORG/$REPO \
+            -d '{"permission":"admin"}'
