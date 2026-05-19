@@ -1,0 +1,178 @@
+# Reusable workflow — host this in digismoothie/.github/.github/workflows/
+# Individual repos opt in by calling it (see weekly-docs-update.yml template).
+#
+# Required secret in the calling repo: ANTHROPIC_API_KEY
+
+name: Update Docs (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      docs_file:
+        description: "Path to the documentation file to keep updated"
+        type: string
+        default: "README.md"
+      lookback_days:
+        description: "How many days of commits to analyze"
+        type: number
+        default: 7
+      base_branch:
+        description: "Branch to open the PR against"
+        type: string
+        default: "main"
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+jobs:
+  update-docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect recent commits
+        id: commits
+        run: |
+          SINCE=$(date -d "${{ inputs.lookback_days }} days ago" +%Y-%m-%d 2>/dev/null || date -v-${{ inputs.lookback_days }}d +%Y-%m-%d)
+          LOG=$(git log --since="$SINCE" --pretty=format:"%h %ad %s%n%b" --date=short origin/${{ inputs.base_branch }} 2>/dev/null || git log --since="$SINCE" --pretty=format:"%h %ad %s%n%b" --date=short)
+
+          if [ -z "$LOG" ]; then
+            echo "No commits in the last ${{ inputs.lookback_days }} days — skipping."
+            echo "has_commits=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_commits=true" >> "$GITHUB_OUTPUT"
+            # Write to file to avoid shell escaping issues
+            echo "$LOG" > /tmp/commits.txt
+          fi
+
+      - name: Read current docs file
+        if: steps.commits.outputs.has_commits == 'true'
+        id: read_docs
+        run: |
+          if [ -f "${{ inputs.docs_file }}" ]; then
+            cp "${{ inputs.docs_file }}" /tmp/current_docs.txt
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "# $(basename ${{ inputs.docs_file }} .md)" > /tmp/current_docs.txt
+            echo "_This file was automatically created._" >> /tmp/current_docs.txt
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.commits.outputs.has_commits == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Anthropic SDK
+        if: steps.commits.outputs.has_commits == 'true'
+        run: pip install anthropic --quiet
+
+      - name: Ask Claude to update docs
+        if: steps.commits.outputs.has_commits == 'true'
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DOCS_FILE: ${{ inputs.docs_file }}
+        run: |
+          python3 << 'PYEOF'
+          import os
+          import sys
+          import anthropic
+
+          commits = open("/tmp/commits.txt").read().strip()
+          current_docs = open("/tmp/current_docs.txt").read().strip()
+          docs_file = os.environ["DOCS_FILE"]
+
+          client = anthropic.Anthropic()
+
+          system_prompt = f"""You are a technical documentation maintainer for a software project.
+          Your job is to keep {docs_file} accurate and useful for developers.
+
+          Rules:
+          - Only update the docs when commits introduce SIGNIFICANT changes:
+            new features, breaking changes, new dependencies, changed setup/install steps,
+            new environment variables, removed or renamed commands, major refactors that change
+            how the project is used.
+          - IGNORE: style tweaks, typo fixes, minor refactors, dependency version bumps,
+            test changes, CI changes, comment updates.
+          - Preserve the existing structure, tone, and formatting of the document.
+          - Do not add a changelog section or list every commit — update the relevant sections
+            in-place so the docs always describe the CURRENT state, not history.
+          - If no significant changes warrant a docs update, respond with exactly: NO_CHANGES_NEEDED
+          - If an update IS needed, respond with the full updated file contents only —
+            no explanation, no markdown fences, just the file content."""
+
+          user_message = f"""Commits from the last {os.environ.get('LOOKBACK_DAYS', '7')} days on this repository:
+
+          {commits}
+
+          ---
+
+          Current contents of {docs_file}:
+
+          {current_docs}
+
+          ---
+
+          Should the documentation be updated? If yes, return the full updated file.
+          If no significant changes require a docs update, return NO_CHANGES_NEEDED."""
+
+          message = client.messages.create(
+              model="claude-opus-4-7",
+              max_tokens=8096,
+              messages=[{"role": "user", "content": user_message}],
+              system=system_prompt,
+          )
+
+          result = message.content[0].text.strip()
+
+          if result == "NO_CHANGES_NEEDED":
+              print("Claude: no significant changes — docs are up to date.")
+              open("/tmp/claude_result.txt", "w").write("NO_CHANGES_NEEDED")
+          else:
+              print("Claude: docs need updating — writing new content.")
+              open("/tmp/claude_result.txt", "w").write(result)
+              open(docs_file, "w").write(result)
+          PYEOF
+        env:
+          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+
+      - name: Check if update is needed
+        id: check_update
+        run: |
+          RESULT=$(cat /tmp/claude_result.txt)
+          if [ "$RESULT" = "NO_CHANGES_NEEDED" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open PR with updated docs
+        if: steps.check_update.outputs.needs_update == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          commit-message: "docs: auto-update ${{ inputs.docs_file }} based on recent commits"
+          branch: "auto-docs/weekly-update"
+          delete-branch: true
+          base: ${{ inputs.base_branch }}
+          title: "docs: weekly auto-update for ${{ inputs.docs_file }}"
+          body: |
+            Automated weekly documentation update generated by Claude.
+
+            **Analyzed commits from the last ${{ inputs.lookback_days }} days.**
+
+            Claude identified significant changes that warranted updating `${{ inputs.docs_file }}`.
+            Please review the diff before merging.
+
+            ---
+            _Generated by the [update-docs workflow](/.github/workflows/update-docs-reusable.yml)_
+          labels: "documentation,automated"
