@@ -48,7 +48,6 @@ jobs:
             echo "has_commits=false" >> "$GITHUB_OUTPUT"
           else
             echo "has_commits=true" >> "$GITHUB_OUTPUT"
-            # Write to file to avoid shell escaping issues
             echo "$LOG" > /tmp/commits.txt
           fi
 
@@ -81,6 +80,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           DOCS_FILE: ${{ inputs.docs_file }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
         run: |
           python3 << 'PYEOF'
           import os
@@ -142,8 +142,6 @@ jobs:
               open("/tmp/claude_result.txt", "w").write(result)
               open(docs_file, "w").write(result)
           PYEOF
-        env:
-          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
 
       - name: Check if update is needed
         id: check_update
